@@ -1,0 +1,26 @@
+{
+    "name": "expurgate-solo",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/git:1": {}
+    },
+    "workspaceFolder": "/opt/expurgate/config",
+    "workspaceMount": "source=${localWorkspaceFolder}/config,target=/opt/expurgate/config,type=bind",
+    "appPort": [
+        "4053:53/udp"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "vscode-icons-team.vscode-icons",
+                "ms-python.python",
+                "ms-python.pylint",
+                "GitHub.copilot",
+                "eamodio.gitlens"
+            ]
+        }
+    },
+    "remoteUser": "root"
+}

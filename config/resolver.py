@@ -106,7 +106,7 @@ else:
     source_prefix_off = True
     
     mydomains = ['_spf.google.com','_netblocks.mimecast.com','spf.protection.outlook.com','outbound.mailhop.org','spf.messagelabs.com','mailgun.org','sendgrid.net','service-now.com'] # demo mode
-    print("MY_DOMAIN not set, running in demo mode using " + str(mydomains))
+    print("MY_DOMAINS not set, running in demo mode using " + str(mydomains))
 
 totaldomaincount = len(mydomains)
 
@@ -226,7 +226,7 @@ def getSPF(domain):
            result = dnsLookup(domain,"TXT")
    
     except:
-        print("An exception occurred, check there is a DNS TXT record with SPpF present at: " + str(source_prefix) + "." + str(domain) )
+        print("An exception occurred, check there is a DNS TXT record with SPF present at: " + str(source_prefix) + "." + str(domain) )
     if result:
         for record in result:
             if record != None and re.match('^"v=spf1 ', record, re.IGNORECASE):
