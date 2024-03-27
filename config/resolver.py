@@ -438,7 +438,7 @@ while totaldomaincount > 0:
 
         ip4header.append(":3:v=spf1 ip4:$ " + spfActionValue)
         if len(otherValues) > 0:
-            therValues = list(dict.fromkeys(otherValues)) #dedupe
+            otherValues = list(dict.fromkeys(otherValues)) #dedupe
             ip4block = [":99:v=spf1 " + ' '.join(otherValues) + " " + spfActionValue]
             ip6block = [":99:v=spf1 " + ' '.join(otherValues) + " " + spfActionValue]
         else:
