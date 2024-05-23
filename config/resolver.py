@@ -1,524 +1,529 @@
-# author: https://github.com/smck83/
-xpg8logo = ["# "]
-xpg8logo.append("#  ______                                  _       ")
-xpg8logo.append("# |  ____|                                | |      ")
-xpg8logo.append("# | |__  __  ___ __  _   _ _ __ __ _  __ _| |_ ___ ")
-xpg8logo.append("# |  __| \ \/ / '_ \| | | | '__/ _` |/ _` | __/ _ \\")
-xpg8logo.append("# | |____ >  <| |_) | |_| | | | (_| | (_| | ||  __/")
-xpg8logo.append("# |______/_/\_\ .__/ \__,_|_|  \__, |\__,_|\__\___|")
-xpg8logo.append("#             | |               __/ |              ")
-xpg8logo.append("#             |_|              |___/               \n#")
-xpg8logo.append("# https://xpg8.ehlo.email | https://github.com/smck83/expurgate-solo ")
-from cmath import log
-from sys import stdout
-from time import sleep
-from time import strftime
-import dns.resolver
+"""
+Processing domains SPF records and write rbldnsd config files.
+Include should look like this: v=spf1 include:%{ir}.<domain>.<zone> ~all"
+"""
+
+import asyncio
+import dataclasses
 import re
-from datetime import datetime
 import os
-import signal
-from pathlib import Path
+import glob
 import shutil
-import time
-import math
-import requests
+import signal
+from datetime import datetime, timedelta
+from time import strftime, localtime
+from pathlib import Path
+from os import environ
 import json
-import ipaddress
-import sys
+import rollbar
+from dotenv import load_dotenv
+import dns.resolver
+import requests
 from jsonpath_ng.ext import parse
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from nats.aio.client import Client as NATS
 
-paddingchar = "^"
-spfActionValue ="~all" # default spfAction if lookup fails or not present
-ipmonitorCompare = {}
-loopcount = 0
-totalChangeCount = 0
-lastChangeTime = "No changes"
+load_dotenv()
+rollbar.init(
+  access_token=environ.get('ROLLBAR_TOKEN'),
+  environment=environ.get('ROLLBAR_ENV', 'local'),
+  code_version=environ.get('EXPURGATE_VERSION', '1.0.0')
+)
 
-if 'RESTDB_URL' in os.environ:
-    restdb_url = os.environ['RESTDB_URL']
-else:
-    restdb_url = None
+@dataclasses.dataclass
+class SPFProcessor:
+    """Processing SPF records for specific domain."""
+    ip4_subnet_gen_reg = r'^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/([1-2][0-9]|[3][0-1])$'
+    ip4_subnet_32_reg = r'^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(/32)?$'
 
-if 'RESTDB_KEY' in os.environ:
-    restdb_key = os.environ['RESTDB_KEY']
-else:
-    restdb_key = None
+    def __init__(self, source_prefix = '_wqjnwiwc'):
+        self.source_prefix = source_prefix
+        self.dns_cache = {}
+        self.includes = []
+        self.ipmonitor = []
 
-if 'DISCORD_WEBHOOK' in os.environ and re.match('^https:\/\/discord.com\/api\/webhooks\/.*',os.environ['DISCORD_WEBHOOK'], re.IGNORECASE):
-    discordwebhook = os.environ['DISCORD_WEBHOOK']
-else:
-    discordwebhook = None
+    def handle_error(self, error):
+        """Handling errors."""
+        # TODO: a way to notify about errors
+        print(str(error))
 
+    def dns_lookup(self, domain, record_type):
+        """Making dns lookup on specific domain and record type."""
+        lookup_key = domain + "-" + record_type
+        errors = []
 
-if 'UPTIMEKUMA_PUSH_URL' in os.environ and re.match('^http.*\/api\/push\/.*\&ping\=',os.environ['UPTIMEKUMA_PUSH_URL'], re.IGNORECASE):
-    uptimekumapushurl = os.environ['UPTIMEKUMA_PUSH_URL']
-else:
-    uptimekumapushurl = None
+        if lookup_key not in self.dns_cache:
+            try:
+                rrset = dns.resolver.resolve(domain, record_type).rrset
+                lookup = [dns_record.to_text() for dns_record in rrset]
+            except Exception as e:
+                error = "DNS Resolution Error - " + record_type + ":" + domain + ' err: ' + str(e)
+                errors.append(error)
 
-if 'SOURCE_PREFIX_OFF' in os.environ:
-    source_prefix_off = os.environ['SOURCE_PREFIX_OFF']
-else:
-    source_prefix_off = False # set to True to be able to run against root domain, for flattening a specific host you don't control e.g. replace include:_spf.google.com which needs 3 lookups with include:%{ir}._spf.google.com._spf.yourdomain.com or include:outbound.mailhop.org which needs 4 lookups with include:%{ir}.outbound.mailhop.org._spf.yourdomain.com
+                return None, errors
 
-if 'SOURCE_PREFIX' in os.environ:
-    source_prefix = os.environ['SOURCE_PREFIX']
-else:
-    source_prefix = "_xpg8"
+            self.dns_cache[lookup_key] = lookup
 
-def restdb(restdb_url,restdb_key):
-    payload={}
-    headers = {
-    'Content-Type': 'application/json',
-    'x-apikey': restdb_key
-    }
+            return lookup, errors
 
-    domains = []
-    try:
-        response = requests.request("GET", restdb_url, headers=headers, data=payload)
-    except:
-        print("Error - restdb request failed")
-        return mydomains    # added 12.May.23
-    else:
-        out = response.text
-        aList = json.loads(out)
-        jsonpath_expression = parse("$..domain")
+        print("==[CACHE][" + domain + "] Grabbed from DNS Cache - " + record_type)
 
-        for match in jsonpath_expression.find(aList):
-            domains.append(match.value)
-        if len(domains) > 0:
-            return domains
-        else:                   # added 12.May.23
-            return mydomains    # added 12.May.23
+        return self.dns_cache[lookup_key], errors
 
-
-if 'MY_DOMAINS' in os.environ and restdb_url == None:
-    domains = os.environ['MY_DOMAINS']
-    mydomains = domains.split(' ') # convert input string to list
-    mydomains = [domain for domain in mydomains if '.' in domain] # confirm domain contains a fullstop
-    mydomains = list(dict.fromkeys(mydomains)) # dedupe the list of domains
-elif restdb_url != None:
-    restdbdomains = restdb(restdb_url,restdb_key)
-    if len(restdbdomains) > 0:
-        mydomains = restdbdomains
-
-else:
-    source_prefix_off = True
-    
-    mydomains = ['_spf.google.com','_netblocks.mimecast.com','spf.protection.outlook.com','outbound.mailhop.org','spf.messagelabs.com','mailgun.org','sendgrid.net','service-now.com'] # demo mode
-    print("MY_DOMAINS not set, running in demo mode using " + str(mydomains))
-
-totaldomaincount = len(mydomains)
-
-if 'DELAY' in os.environ and int(os.environ['DELAY']) > 29:
-    delayBetweenRun = os.environ['DELAY']
-else:
-    delayBetweenRun = 300 #default to 5 minutes
-print("Running delay of : " + str(delayBetweenRun))
-
-def append2disk(input,filename):
-    with open("/opt/expurgate/" + filename,"a") as file2append:
-        file2append.write(str(input))
-
-def write2disk(src_path,dst_path,myrbldnsdconfig):
-    with open(src_path, 'w') as fp:
-        for item in myrbldnsdconfig:
-            # write each item on a new line
-            fp.write("%s\n" % item)
-    shutil.move(src_path, dst_path)
-    print("[" + str(loopcount) + ': CHANGE DETECTED] Writing config file:' + dst_path)
-
-def ipInSubnet(an_address,a_network):
-    an_address = ipaddress.ip_address(an_address)
-    a_network = ipaddress.ip_network(a_network)
-    address_in_network = an_address in a_network
-    return address_in_network 
-
-def uptimeKumaPush (url):
-    try:
-        x = requests.get(url)
-    except:
-        print("ERROR: Uptime Kuma - push notification",file=sys.stderr)
-
-def messageDiscord (content,delay:int=1):
-    time.sleep(delay)
-    if discordwebhook != None and content != None:
-        body = {
-            "content" : str(content)
+    def process_spf(self, domain, depth = 0):
+        """Processing SPF records for specific domain."""
+        source_domain = self.source_prefix + "." + domain if depth == 0 else domain
+        spf_records, errors = self.dns_lookup(source_domain, "TXT")
+        process_result = {
+            'domain': domain,
+            'ip4': [],
+            'ip6': [],
+            'others': [],
+            'spf_action': '~all',
         }
-        headers = {
-            "Content-Type" : "application/json"
 
-        }
-        #print(str(json.dumps(body)))
-        try:
-            requests.post(discordwebhook,headers=headers,data=str(json.dumps(body)))
-            print("SUCCESS: Discord - Message")
-        except Exception as e:
-            print("ERROR: Discord - Message",e)
+        if not spf_records:
+            error = "==[ERROR][" + domain + "] No SPF Records Found"
+            self.handle_error(error)
+            errors.append(error)
 
-def dnsLookup(domain,type,countDepth="on"):
-    global depth
-    global cacheHit
-    mydomains_source_success_status = False
-    lookupKey = domain + "-" + type
-    if lookupKey not in dnsCache:
-        try:
-            lookup = [dns_record.to_text() for dns_record in dns.resolver.resolve(domain, type).rrset]
+            return process_result, errors
 
-        except Exception as e:
-            error = "ERROR : Unhandled exception - " + domain + "[" + type + "]"
-            if type != "AAAA": # dont log failed ipv6 address lookups
-                print(error)
-                header.append("# " + error)
-            print(e)
-            if depth == 0 and type=="TXT":
-                mydomains_source_failure.append(domain)
-        else:
-            if depth == 0 and type=="TXT":
-                for record in lookup:
-                    if record != None and re.match('^"v=spf1 ', record, re.IGNORECASE): # check if the first lookup record has a TXT SPF record.
-                        mydomains_source_success_status = True
+        for record in spf_records:
+            if record is not None and re.match('^"v=spf1 ', record, re.IGNORECASE):
+                spf_parts = record.replace("\" \"","").replace("\"","").split()
 
-                if mydomains_source_success_status == True: # using boolean, so as to only add 1 record (incase a domain has multiple v=spf1 records)
-                    mydomains_source_success.append(domain)
-                else:
-                    mydomains_source_failure.append(domain) # has TXT record, but no SPF records.
-                    print(domain,lookup)
-                    time.sleep(1)
-            dnsCache[lookupKey] = lookup
-            print("++[CACHE][" + domain + "] Added to DNS Cache - " + type)
-            if countDepth=="on":
-                depth += 1
+                for spf_part in spf_parts:
+                    if re.match(r'^[+-~?](all)$', spf_part, re.IGNORECASE):
+                        process_result["spf_action"] = spf_part
 
-            return lookup 
-    else:
-        lookup = dnsCache[lookupKey]
-        if depth == 0 and type == "TXT":
-            for record in lookup:
-                if record != None and re.match('^"v=spf1 ', record, re.IGNORECASE): # check if the first lookup record has a TXT SPF record.
-                    mydomains_source_success_status = True
+                    elif re.match('redirect=', spf_part, re.IGNORECASE):
+                        _, redirect = spf_part.split('=')
 
-            if mydomains_source_success_status == True: # using boolean, so as to only add 1 record (incase a domain has multiple v=spf1 records)
-                mydomains_source_success.append(domain)
-            else:
-                mydomains_source_failure.append(domain) # has TXT record, but no SPF records.
-                print(domain,lookup)
-                time.sleep(1)        
-        
-        if countDepth=="on":
-            depth += 1
-        cacheHit += 1
-        print("==[CACHE][" + domain + "] Grabbed from DNS Cache - " + type)
-        return lookup  
+                        if redirect != domain and redirect and redirect not in self.includes:
+                            self.includes.append(redirect)
+                            nested_result, nested_errors = self.process_spf(redirect, depth + 1)
 
-def getSPF(domain):
-    global depth
-    try:
-        if depth == 0 and source_prefix_off == False:
-            sourcerecord = source_prefix + "." + domain
-            header.append("# Source of truth:  " + sourcerecord)
-            result = dnsLookup(sourcerecord,"TXT")
-        elif depth == 0:
-            header.append("# Source of truth:  " + domain + " - Will not work in production unless you replace a single record. e.g. include:" + domain + " with include:{ir}." + domain + "._spf.yourdomain.com")
-            result = dnsLookup(domain,"TXT")
-        else:
-           result = dnsLookup(domain,"TXT")
-   
-    except:
-        print("An exception occurred, check there is a DNS TXT record with SPF present at: " + str(source_prefix) + "." + str(domain) )
-    if result:
-        for record in result:
-            if record != None and re.match('^"v=spf1 ', record, re.IGNORECASE):
-                # replace " " with nothing which is used where TXT records exceed 255 characters
-                record = record.replace("\" \"","")
-                # remove " character from start and end
-                spfvalue = record.replace("\"","")
-                spfParts = spfvalue.split()
-                header.append("# " + (paddingchar * depth) + " " + domain)           
-                header.append("# " + (paddingchar * depth) + " " + spfvalue)
+                            if len(nested_errors) > 0:
+                                errors.extend(nested_errors)
+                            else:
+                                process_result["ip4"].extend(nested_result["ip4"])
+                                process_result["ip6"].extend(nested_result["ip6"])
+                                process_result["others"].extend(nested_result["others"])
 
-                for spfPart in spfParts:
-                    if re.match('^[\+\-\~\?](all)$', spfPart, re.IGNORECASE):
-                        spfAction.append(spfPart)
-                    elif re.match('redirect=', spfPart, re.IGNORECASE):
-                        spfValue = spfPart.split('=')       
-                        if spfValue[1] != domain and spfValue[1] and spfValue[1] not in includes:
-                            includes.append(spfValue[1])
-                            getSPF(spfValue[1])
-                    elif re.match('^(\+|)include\:', spfPart, re.IGNORECASE) and "%{" not in spfPart:
-                        spfValue = spfPart.split(':')
-                        if spfValue[1] != domain and spfValue[1] and spfValue[1] not in includes:
-                            includes.append(spfValue[1])
-                            getSPF(spfValue[1])
-                        elif spfValue[1]:
-                            error = "WARNING: Loop or Duplicate: " + spfValue[1] + " in " + domain
-                            header.append("# " + error)
-                            print(error)
-                            #print(error,file=sys.stderr)
-                    elif re.match('^(\+|)ptr\:', spfPart, re.IGNORECASE):
-                            otherValues.append(spfPart)
-                            ipmonitor.append(spfPart)
-                    elif re.match('^(\+|)ptr', spfPart, re.IGNORECASE):
-                            otherValues.append(spfPart + ':' + domain)
-                            ipmonitor.append(spfPart + ':' + domain)                         
-                    elif re.match('^(\+|)a\:', spfPart, re.IGNORECASE):
-                        spfValue = spfPart.split(':')
-                        result = dnsLookup(spfValue[1],"A")
-                        result6 = dnsLookup(spfValue[1],"AAAA")  
+                    elif re.match(r'^(\+|)include:', spf_part, re.IGNORECASE) and "%{" not in spf_part:
+                        _, include = spf_part.split(':')
+
+                        if include != domain and include and include not in self.includes:
+                            self.includes.append(include)
+                            nested_result, nested_errors = self.process_spf(include, depth + 1)
+
+                            if len(nested_errors) > 0:
+                                errors.extend(nested_errors)
+                            else:
+                                process_result["ip4"].extend(nested_result["ip4"])
+                                process_result["ip6"].extend(nested_result["ip6"])
+                                process_result["others"].extend(nested_result["others"])
+                        elif include:
+                            warning = "WARNING: Loop or Duplicate: " + include + " in " + domain
+                            print(warning)
+
+                    elif re.match(r'^(\+|)ptr:', spf_part, re.IGNORECASE):
+                        process_result["others"].append(spf_part)
+                        self.ipmonitor.append(spf_part)
+
+                    elif re.match(r'^(\+|)ptr', spf_part, re.IGNORECASE):
+                        process_result["others"].append(spf_part + ':' + domain)
+                        self.ipmonitor.append(spf_part + ':' + domain)
+
+                    elif re.match(r'^(\+|)a:', spf_part, re.IGNORECASE):
+                        _, a_domain = spf_part.split(':')
+                        result = self.dns_lookup(a_domain, "A")
+                        result6 = self.dns_lookup(a_domain, "AAAA")
+
                         if result:
-                            header.append("# " + (paddingchar * depth) + " " + spfPart)
-                            result = [(x + ' # a:' + spfValue[1]) for x in result]
+                            result = [(x + ' # a:' + a_domain) for x in result]
                             result.sort()
-                            for record in result:
-                                ip4.append(record)
+                            process_result["ip4"].extend(result)
+
                         if result6:
-                            header.append("# " + (paddingchar * depth) + " " + spfPart)
-                            result6 = [(x + ' # aaaa:' + spfValue[1]) for x in result6]
+                            result6 = [(x + ' # aaaa:' + a_domain) for x in result6]
                             result6.sort()
-                            for record in result6:
-                                ip6.append(record)
-                    elif re.match('^(\+|)a', spfPart, re.IGNORECASE):
-                        result = dnsLookup(domain,"A")
-                        result6 = dnsLookup(domain,"AAAA")
-                        if result:  
-                            header.append("# " + (paddingchar * depth) + " " + spfPart + "(" + domain + ")")
+                            process_result["ip6"].extend(result6)
+
+                    elif re.match(r'^(\+|)a', spf_part, re.IGNORECASE):
+                        result = self.dns_lookup(domain, "A")
+                        result6 = self.dns_lookup(domain, "AAAA")
+
+                        if result:
                             result = [x + " # a(" + domain + ")" for x in result]
                             result.sort()
-                            for record in result:
-                                ip4.append(record)
-                        if result6:  
-                            header.append("# " + (paddingchar * depth) + " " + spfPart + "(" + domain + ")")
+                            process_result["ip4"].extend(result)
+
+                        if result6:
                             result6 = [x + " # aaaa(" + domain + ")" for x in result6]
                             result6.sort()
-                            for record in result6:
-                                ip6.append(record)
-                    elif re.match('^(\+|)mx\:', spfPart, re.IGNORECASE):
-                        spfValue = spfPart.split(':')
-                        result = dnsLookup(spfValue[1],"MX") 
-                        if result:    
-                            header.append("# " + (paddingchar * depth) + " " + spfPart)   
-                            mxrecords = []
-                            for mxrecord in result:
-                                mxValue = mxrecord.split(' ')
-                                mxrecords.append(mxValue[1])
-                            mxrecords.sort()
-                            for hostname in mxrecords:
-                                result = dnsLookup(hostname,"A","off")  
-                                result6 = dnsLookup(hostname,"AAAA","off")
-                                if result:
-                                    result = [x + ' # ' + spfPart + '=>a:' + hostname for x in result]
-                                    result.sort()
-                                    for record in result:
-                                        ip4.append(record)
-                                    header.append("# " + (paddingchar * depth) + " " + spfPart + "=>a:" + hostname)
-                                if result6:
-                                    result6 = [x + ' # ' + spfPart + '=>aaaa:' + hostname for x in result6]
-                                    result6.sort()
-                                    for record in result6:
-                                        ip6.append(record)
-                                    header.append("# " + (paddingchar * depth) + " " + spfPart + "=>aaaa:" + hostname)
-                    elif re.match('^(\+|)mx', spfPart, re.IGNORECASE):
-                        result = dnsLookup(domain,"MX")
+                            process_result["ip6"].extend(result6)
+
+                    elif re.match(r'^(\+|)mx:', spf_part, re.IGNORECASE):
+                        _, mx_domain = spf_part.split(':')
+                        result = self.dns_lookup(mx_domain, "MX")
+
                         if result:
-                            header.append("# " + (paddingchar * depth) + " mx(" + domain + ")")
-                            mxrecords = []
-                            for mxrecord in result:
-                                mxValue = mxrecord.split(' ')
-                                mxrecords.append(mxValue[1])
-                            mxrecords.sort()
-                            for hostname in mxrecords:
-                                result = dnsLookup(hostname,"A","off")  
-                                result6 = dnsLookup(hostname,"AAAA","off")
+                            mx_records = []
+
+                            for mx_record in result:
+                                _, mx_server = mx_record.split(' ')
+                                mx_records.append(mx_server)
+
+                            mx_records.sort()
+
+                            for hostname in mx_records:
+                                result = self.dns_lookup(hostname, "A")
+                                result6 = self.dns_lookup(hostname, "AAAA")
+
+                                if result:
+                                    result = [x + ' # ' + spf_part + '=>a:' + hostname for x in result]
+                                    result.sort()
+                                    process_result["ip4"].extend(result)
+
+                                if result6:
+                                    result6 = [x + ' # ' + spf_part + '=>aaaa:' + hostname for x in result6]
+                                    result6.sort()
+                                    process_result["ip6"].extend(result6)
+
+                    elif re.match(r'^(\+|)mx', spf_part, re.IGNORECASE):
+                        result = self.dns_lookup(domain, "MX")
+
+                        if result:
+                            mx_records = []
+
+                            for mx_record in result:
+                                _, mx_server = mx_record.split(' ')
+                                mx_records.append(mx_server)
+
+                            mx_records.sort()
+
+                            for hostname in mx_records:
+                                result = self.dns_lookup(hostname, "A")
+                                result6 = self.dns_lookup(hostname, "AAAA")
+
                                 if result:
                                     result = [x + ' # mx(' + domain + ')=>a:' + hostname for x in result ]
                                     result.sort()
-                                    for record in result:
-                                        ip4.append(record)
-                                    header.append("# " + (paddingchar * depth) + " mx(" + domain + ")=>a:" + hostname)
+                                    process_result["ip4"].extend(result)
+
                                 if result6:
                                     result6 = [x + ' # mx(' + domain + ')=>aaaa:' + hostname for x in result6 ]
                                     result6.sort()
-                                    for record in result6:
-                                        ip6.append(record)
-                                    header.append("# " + (paddingchar * depth) + " mx(" + domain + ")=>aaaa:" + hostname)
-                    elif re.match('^(\+|)ip4\:', spfPart, re.IGNORECASE):
-                        spfValue = re.split("ip4:", spfPart, flags=re.IGNORECASE)
-                        if spfValue[1] not in ipmonitor:
-                            if re.match('^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\/([1-2][0-9]|[3][0-1])$',spfValue[1]): #later check IP against subnet and if present in subnet, ignore.
-                                ipmonitor.append(spfValue[1])
-                                ip4.append(spfValue[1] + " # subnet:" + domain)
-                            elif re.match('^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\/32)?$',spfValue[1]): #later check IP against subnet and if present in subnet, ignore.
-                                ipmonitor.append(spfValue[1])
-                                ip4.append(spfValue[1] + " # ip:" + domain)
+                                    process_result["ip6"].extend(result6)
+
+                    elif re.match(r'^(\+|)ip4:', spf_part, re.IGNORECASE):
+                        _, ip_v4 = re.split("ip4:", spf_part, flags=re.IGNORECASE)
+
+                        if ip_v4 not in self.ipmonitor:
+                            #later check IP against subnet and if present in subnet, ignore.
+                            if re.match(self.ip4_subnet_gen_reg, ip_v4):
+                                self.ipmonitor.append(ip_v4)
+                                process_result["ip4"].append(ip_v4 + " # subnet:" + domain)
+                            # later check IP against subnet and if present in subnet, ignore.
+                            elif re.match(self.ip4_subnet_32_reg, ip_v4):
+                                self.ipmonitor.append(ip_v4)
+                                process_result["ip4"].append(ip_v4 + " # ip:" + domain)
                             else:
-                                ip4.append("# error:" + spfValue[1] + " for " + domain)
-                        else:
-                            header.append('# ' + (paddingchar * depth) + ' [Skipped] already added (ip4):' + spfValue[1] + " " + domain)
-                    elif re.match('(\+|)ip6\:', spfPart, re.IGNORECASE):
-                        spfValue = re.split("ip6:", spfPart, flags=re.IGNORECASE)
-                        if spfValue[1] not in ipmonitor:
-                            ipmonitor.append(spfValue[1])
-                            ip6.append(spfValue[1] + " # " + domain)
-                        else:
-                            header.append('# ' + (paddingchar * depth) + ' [Skipped] already added (ip6):' + spfValue[1] + " " + domain)
-                    elif re.match('v\=spf1', spfPart, re.IGNORECASE):
-                        spfValue = spfPart
-                    elif re.match('exists\:', spfPart, re.IGNORECASE) or re.match('include\:', spfPart, re.IGNORECASE):
-                        print('Added to fail response record:',spfPart)
-                        ipmonitor.append(spfPart)
-                        otherValues.append(spfPart)
-                    #else: drop everything else
+                                process_result["ip4"].append("# error:" + ip_v4 + " for " + domain)
 
-def rbldnsrefresh():
-    rbldnsdpid = Path('/var/run/rbldnsd.pid').read_text().strip()
-    print(f"Notifying rbldnsd there is a change and to refresh the config file(via SIGHUP to pid:{rbldnsdpid})")
-    try:
-        os.kill(int(rbldnsdpid), signal.SIGHUP)
-    except Exception as e:
-        print("Uh-oh! Something went wrong, check 'rbldnsd' is running :",e)
-    else:
-        print(f"Success notifying pid: {rbldnsdpid}")
+                    elif re.match(r'(\+|)ip6:', spf_part, re.IGNORECASE):
+                        _, ip_v6 = re.split("ip6:", spf_part, flags=re.IGNORECASE)
+
+                        if ip_v6 not in self.ipmonitor:
+                            self.ipmonitor.append(ip_v6)
+                            process_result["ip6"].append(ip_v6 + " # " + domain)
+
+                    elif re.match(r'v=spf1', spf_part, re.IGNORECASE):
+                        pass
+
+                    elif re.match(r'exists:', spf_part, re.IGNORECASE) or re.match(r'include:', spf_part, re.IGNORECASE):
+                        print('Added to fail response record:', spf_part)
+                        self.ipmonitor.append(spf_part)
+                        process_result["others"].append(spf_part)
+
+        return process_result, errors
     
+    def get_rbldnsd_part(self, domain):
+        """Process domain SPF and generate rbldnsd config file content."""
+        spf_result, spf_errors = self.process_spf(domain)
 
-while totaldomaincount > 0:
-    mydomains_source_success = []
-    mydomains_source_failure = []
-    dnsCache = {}
-    loopcount += 1
-    changeDetected = 0
-    cacheHit = 0
-    if restdb_url != None:
+        if len(spf_errors) == 0:
+            ip_v4_part = []
+            ip_v6_part = []
+            ips_v4 = [x.strip(' ') for x in spf_result['ip4']]
+            ips_v6 = [x.strip(' ') for x in spf_result['ip6']]
+            ip_v4_part.append("$DATASET ip4set:" + domain + " " + domain)
+            ip_v4_part.append(":3:v=spf1 ip4:$ " + spf_result['spf_action'])
+
+            if len(spf_result['others']) > 0:
+                spf_result['others'] = list(dict.fromkeys(spf_result['others'])) #dedupe
+                ip_v4_block = [":99:v=spf1 " + ' '.join(spf_result['others']) + " " + spf_result['spf_action']]
+                ip_v6_block = [":99:v=spf1 " + ' '.join(spf_result['others']) + " " + spf_result['spf_action']]
+            else:
+                ip_v4_block = [":99:v=spf1 " + spf_result['spf_action']]
+                ip_v6_block = [":99:v=spf1 " + spf_result['spf_action']]
+
+            ip_v4_block.append("0.0.0.0/1 # all other IPv4 addresses")
+            ip_v4_block.append("128.0.0.0/1 # all other IP IPv4 addresses")
+            ip_v6_part.append("$DATASET ip6trie:" + domain + " " + domain)
+            ip_v6_part.append(":3:v=spf1 ip6:$ " + spf_result['spf_action'])
+            ip_v6_block.append("0:0:0:0:0:0:0:0/0 # all other IPv6 addresses")
+            header = [
+                "# Automatically generated rbldnsd config for:" + domain + " @ " + str(datetime.now(tz=None)),
+                "# IP & Subnet: " + str(len(ips_v4 + ips_v6)),
+            ]
+            rbldnsd_parts = header + ip_v4_part + list(set(ips_v4)) + ip_v4_block + ip_v6_part + list(set(ips_v6)) + ip_v6_block
+
+            return rbldnsd_parts, spf_errors
+
+        return "", spf_errors
+
+    def reset(self):
+        """Reset state."""
+        self.dns_cache = {}
+        self.includes = []
+        self.ipmonitor = []
+
+
+@dataclasses.dataclass
+class RBLDNSDProcessor:
+    """Processing rbldnsd config files."""
+    ipmonitor_compare = {}
+    # def __init__(self):
+
+    def rbldns_refresh(self):
+        """Notify rbldnsd to refresh the config file."""
+        rbldnsdpid = Path('/var/run/rbldnsd.pid').read_text('utf-8').strip()
+        print(f"Notifying rbldnsd there is a change and to refresh the config file(via SIGHUP to pid:{rbldnsdpid})")
         try:
-            mydomains = restdb(restdb_url,restdb_key) 
-        except:
-            error = "Error: restdb connection"
-            print(error)
-            print(error,file=sys.stderr)
+            os.kill(int(rbldnsdpid), signal.SIGHUP)
+        except Exception as e:
+            print("Uh-oh! Something went wrong, check 'rbldnsd' is running :", e)
         else:
-            totaldomaincount = len(mydomains)
-    runningconfig = []
-    runningconfig = runningconfig + xpg8logo
-    runningconfig.append("# Running config for: " + str(totaldomaincount) + ' domains' )
-    runningconfig.append("# Source domains: " + ', '.join(mydomains))
-    runningconfig.append("#\n#")
-    start_time = time.time()
-    print('Scanning SPF Records for domains: ' + str(mydomains))
-    domaincount = 0
-    for domain in mydomains:
-        domaincount +=1
-        datetimeNow = datetime.now(tz=None)
-        headersummary = "# Automatically generated rbldnsd config by Expurgate[xpg8.tk] for:" + domain + " @ " + str(datetimeNow)
-        header = []
-        header.append(headersummary)
-        ip4 = []
-        allIp = []
-        ip4header = []
-        ip6 = []
-        ip6header = []
-        spfAction = []
-        otherValues = []
-        depth = 0        
-        includes = []
-        ipmonitor = []
-        stdoutprefix = '[' + str(loopcount) + ": " + str(domaincount) + '/' + str(totaldomaincount) + '][' + domain + "] "
-        print(stdoutprefix + 'Looking up SPF records.')
-        getSPF(domain)
-        
-    # strip spaces
-        ip4 = [x.strip(' ') for x in ip4]
-        ip6 = [x.strip(' ') for x in ip6]
-    # CREATE ARRAYS FOR EACH PART OF THE RBLDNSD FILE
-        header.append("# Depth:" + str(depth))
-        # Set SPF Action
-        if len(spfAction) > 0:
-            spfActionValue = spfAction[0]
-        #header.append("# SPF Cache Hits:" + str(cacheHit))
-        ip4header.append("$DATASET ip4set:"+ domain +" " + domain)
+            print(f"Success notifying pid: {rbldnsdpid}")
 
-        ip4header.append(":3:v=spf1 ip4:$ " + spfActionValue)
-        if len(otherValues) > 0:
-            otherValues = list(dict.fromkeys(otherValues)) #dedupe
-            ip4block = [":99:v=spf1 " + ' '.join(otherValues) + " " + spfActionValue]
-            ip6block = [":99:v=spf1 " + ' '.join(otherValues) + " " + spfActionValue]
-        else:
-            ip4block = [":99:v=spf1 " + spfActionValue]
-            ip6block = [":99:v=spf1 " + spfActionValue]
-        ip4block.append("0.0.0.0/1 # all other IPv4 addresses")
-        ip4block.append("128.0.0.0/1 # all other IP IPv4 addresses")
-        ip6header.append("$DATASET ip6trie:"+ domain + " " + domain)
-        ip6header.append(":3:v=spf1 ip6:$ " + spfActionValue)
-        ip6block.append("0:0:0:0:0:0:0:0/0 # all other IPv6 addresses")
-        allIp = ip4 + ip6
-        header.append("# IP & Subnet: " + str(len(allIp)))
-        ipmonitor.sort() # sort for comparison
-        print(stdoutprefix + 'Comparing CURRENT and PREVIOUS record for changes.')
-        if (domain in ipmonitorCompare) and (ipmonitorCompare[domain] != ipmonitor):
-            changeDetected += 1
-            print(stdoutprefix + 'Change detected! Total Changes:' + str(changeDetected))
-            print(stdoutprefix + 'Previous Record: ' + str(ipmonitorCompare[domain]))
-            print(stdoutprefix + 'New Record: ' + str(ipmonitor))
-            ipAdded = [d for d in ipmonitor if d not in ipmonitorCompare[domain]]
-            ipRemoved = [d for d in ipmonitorCompare[domain] if d not in ipmonitor]
-            print(stdoutprefix + 'Change Summary: +' + str(ipAdded) + ' -' + str(ipRemoved) )
-            changeResult = (strftime("%Y-%m-%dT%H:%M:%S", time.localtime()) + ' | CHANGE:' + domain + " | " + "+" + str(ipAdded) + " -" + str(ipRemoved) + '\n')
-            append2disk(changeResult,'change.log')
-            messageDiscord(changeResult)
-            ipmonitorCompare[domain] = ipmonitor
-            
-        elif (domain in ipmonitorCompare) and (ipmonitorCompare[domain] == ipmonitor):
-            print(stdoutprefix + 'Exact match! - No change detected')
+    def combine_files(self, directory, extension, output_filename):
+        """Combine files into one."""
+        # Create full path for files to combine
+        file_paths = glob.glob(os.path.join(directory, extension))
+        # Define the output file path
+        output_file_path = os.path.join(directory, output_filename)
+
+        # Open the output file and write the contents of each input file
+        with open(output_file_path, 'w', encoding='utf-8') as output_file:
+            for file_path in file_paths:
+                with open(file_path, 'r', encoding='utf-8') as input_file:
+                    output_file.write(input_file.read() + '\n')
+
+    def write_to_disk(self, src_path, dst_path, rbldnsd_config):
+        """Write config to a file."""
+        with open(src_path, 'w', encoding='utf-8') as fp:
+            fp.write('\n'.join(rbldnsd_config))
+
+        shutil.move(src_path, dst_path)
+        print('Writing config file:' + dst_path)
+
+    def process_rbldnsd(self, domain):
+        """Process rbldnsd config file for specific domain."""
+        spf_processor = SPFProcessor(environ.get('SOURCE_PREFIX', None))
+        print('started new processing for domain: ' + domain)
+        config_parts, gen_errors = spf_processor.get_rbldnsd_part(domain)
+        spf_processor.ipmonitor.sort()
+        ipmonitor = spf_processor.ipmonitor
+        changes_detected = 0
+        ipmonitor_compare = self.ipmonitor_compare
+
+        if len(gen_errors) > 0:
+            print('Error(s) detected while processing SPF records for domain: ' + domain)
+            print('\n'.join(gen_errors))
+            print('Aborting further processing for domain.')
+            return False
+
+        print('Comparing CURRENT and PREVIOUS record for changes.')
+
+        if (domain in ipmonitor_compare) and (ipmonitor_compare[domain] != ipmonitor):
+            changes_detected += 1
+            print('Change detected! domain:' + domain)
+            print('Previous Record: ' + str(ipmonitor_compare[domain]))
+            print('New Record: ' + str(ipmonitor))
+
+            ips_added = [d for d in ipmonitor if d not in ipmonitor_compare[domain]]
+            ips_removed = [d for d in ipmonitor_compare[domain] if d not in ipmonitor]
+
+            print('Change Summary: +' + str(ips_added) + ' -' + str(ips_removed) )
+
+            change_result = (strftime("%Y-%m-%dT%H:%M:%S", localtime()) + ' | CHANGE:' + domain + " | " + "+" + str(ips_added) + " -" + str(ips_removed) + '\n')
+
+            print('Changes: ' + change_result)
+
+            self.ipmonitor_compare[domain] = ipmonitor
+
+        elif (domain in ipmonitor_compare) and (ipmonitor_compare[domain] == ipmonitor):
+            print('Exact match! - No change detected')
 
         else:
-            changeDetected += 1
-            messageDiscord(stdoutprefix + 'First run, or a domain has only just been added:  \n\n+' + str(ipmonitor),2)
-            print(stdoutprefix + 'Change detected - First run, or a domain has only just been added.')
+            changes_detected += 1
+            print('Change detected - First run, or a domain has only just been added.')
 
-            ipmonitorCompare[domain] = ipmonitor
+            self.ipmonitor_compare[domain] = ipmonitor
 
-        # Join all the pieces together, ready for file output
-        myrbldnsdconfig = header + ip4header + list(set(ip4)) + ip4block + ip6header + list(set(ip6)) + ip6block # Change ip4 and ip6 to set() to remove duplicate rows 16.06.23 - will not help if IP is duplicate from multiple source hostnames (e.g. different # comment appended)
+        if changes_detected > 0:
+            src_path = r'output/' + domain.replace(".", "-") + ".staging"
+            dst_path = r'output/' + domain.replace(".", "-") + ".rbldnsd"
+
+            self.write_to_disk(src_path, dst_path, config_parts)
+
+        return changes_detected > 0
+
+    def reset(self):
+        """Reset state."""
+        self.ipmonitor_compare = {}
+
+def get_domains():
+    """Get list of domains from AutoSPF api"""
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + environ.get('AUTOSPF_TOKEN')
+    }
+    domains = []
+    try:
+        response = requests.request("GET", environ.get('AUTOSPF_URL'), headers=headers, timeout=15)
+        out = response.text
+        domain_list = json.loads(out)
+        jsonpath_expression = parse("$..name")
+
+        for match in jsonpath_expression.find(domain_list):
+            domains.append(match.value)
+    except Exception as e:
+        print('error occured on getting domains from autospf: ', e)
+        rollbar.report_exc_info()
+
+    return domains
+
+def rollbar_exception_catcher(func):
+    """Catching errors and reporting to rollbar"""
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            rollbar.report_exc_info()
+            raise e
+    return wrapper
+
+@rollbar_exception_catcher
+async def process_domains():
+    """Processing domains"""
+    processor = RBLDNSDProcessor()
+    domains = get_domains()
+    should_refresh = False
     
-        # Build running config
-        runningconfig = runningconfig + myrbldnsdconfig
-        print(stdoutprefix + 'Required ' + str(depth) + ' lookups.')
-    if changeDetected > 0  and len(mydomains) == len(mydomains_source_success):
-        totalChangeCount += 1
-        src_path = r'/var/lib/rbldnsd/runningconfig.staging'
-        dst_path = r'/var/lib/rbldnsd/running-config'               
-        write2disk(src_path,dst_path,runningconfig)
-        lastChangeTime = strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-        time.sleep(1)
-        rbldnsrefresh() # tell rbldnsd to rescan <dst_path> for changes
-    elif len(mydomains_source_failure) > 0:
-        source_failure_output = f"{stdoutprefix} ERROR: {len(mydomains_source_success)} out of {len(mydomains)} of your domains in MY_DOMAINS resolved successfully."
-        messageDiscord (str(source_failure_output))
-        print(source_failure_output)
-        print("ERROR: Ensure each domain in MY_DOMAINS has a valid SPF record setup at SOURCE_PREFIX.<domainname>")
-        print("ERROR: No config file written, ensure internet and dns connectivity is working")
-        print("ERROR: SPF TXT records requiring attention:",len(mydomains_source_failure),"-", str(mydomains_source_failure))
+    for domain in domains:
+        print('Processing domain: ' + domain)
+        changed = processor.process_rbldnsd(domain)
+
+        if changed:
+            should_refresh = True
+
+    if should_refresh:
+        print('At least one domain changed, refreshing config')
+        dst_path = r'/var/lib/rbldnsd/running-config'
+        processor.combine_files('output', '*.rbldnsd', dst_path)
+        processor.rbldns_refresh()
     else:
-        print(f"{len(mydomains_source_success)} out of {len(mydomains)} of your domains in MY_DOMAINS resolved successfully.")
-        print("SPF TXT records requiring attention:",len(mydomains_source_failure),"-", str(mydomains_source_failure))
-        #print(mydomains_source_success)
-        print(f"No issues & no changes detected - No file written (Changes: {str(changeDetected)}, Last change: {lastChangeTime})")
-    print("MODE: Running Config")
+        print('No changes detected, skipping refresh')
 
-    end_time = time.time()
-    time_lapsed = (end_time - start_time)
-    print(strftime("%Y-%m-%dT%H:%M:%S", time.localtime()) + ' | Time Lapsed (seconds):' + str(math.ceil(time_lapsed)))
-    if uptimekumapushurl != None:
-        time_lapsed = time_lapsed * 1000 # calculate loop runtime and convert from seconds to milliseconds
-        print(strftime("%Y-%m-%dT%H:%M:%S", time.localtime()) + " | Pushing Uptime Kuma - endpoint : " + uptimekumapushurl + str(math.ceil(time_lapsed)))
-        uptimeKumaPush(uptimekumapushurl + str(math.ceil(time_lapsed)))
-    dnsReqTotal = len(dnsCache) + cacheHit
-    if dnsReqTotal > 0:
-        print(strftime("%Y-%m-%dT%H:%M:%S", time.localtime()) + " | Total Requests:" + str(dnsReqTotal) + " | DNS Cache Size:" + str(len(dnsCache)) + " | DNS Cache Hits:" + str(cacheHit) + " | DNS Cache vs Total:" + str(math.ceil((cacheHit/dnsReqTotal)*100)) + "%")
-    else:
-        print(strftime("%Y-%m-%dT%H:%M:%S", time.localtime()) + " | Total Requests:" + str(dnsReqTotal) + " | DNS Cache Size:" + str(len(dnsCache)) + " | DNS Cache Hits:" + str(cacheHit))
-    print("Total Changes:" + str(totalChangeCount) + " | Last Change:" + lastChangeTime)
-    print(strftime("%Y-%m-%dT%H:%M:%S", time.localtime()) + " | Waiting " + str(delayBetweenRun) + " seconds before running again... ")  
-    sleep(int(delayBetweenRun)) # wait DELAY in secondsbefore running again.
+@rollbar_exception_catcher
+async def process_domain_event(msg):
+    """Processing domain event from nats"""
+    data = json.loads(msg.data.decode())
+    domain = data['domain']
+    print('Asked to process domain through nats: ' + domain)
+    processor = RBLDNSDProcessor()
+    changed = processor.process_rbldnsd(domain)
 
+    if changed:
+        print('Asked to parse domain, refreshing config')
+        dst_path = r'/var/lib/rbldnsd/running-config'
+        processor.combine_files('output', '*.rbldnsd', dst_path)
+        processor.rbldns_refresh()
 
+@rollbar_exception_catcher
+async def remove_domain_event(msg):
+    """Remove domain event from nats"""
+    data = json.loads(msg.data.decode())
+    domain = data['domain']
+    print('Asked to remove domain through nats: ' + domain)
+    domain_file = r'output/' + domain.replace(".", "-") + ".rbldnsd"
+    
+    if os.path.exists(domain_file):
+        os.remove(domain_file)
+        print('Removed domain file: ' + domain_file)
+        processor = RBLDNSDProcessor()
+        print('Removed domain, refreshing config')
+        dst_path = r'/var/lib/rbldnsd/running-config'
+        processor.combine_files('output', '*.rbldnsd', dst_path)
+        processor.rbldns_refresh()
 
+async def run_scheduler():
+    """Running scheduler to process domains"""
+    print('Running scheduler...')
+    scheduler = AsyncIOScheduler()
+    first_run_time = datetime.now() + timedelta(seconds=10)
+    scheduler.add_job(
+        process_domains,
+        'interval',
+        # seconds=10,
+        minutes=2,
+        max_instances=1,
+        next_run_time=first_run_time
+    )
+    scheduler.start()
+    print('Scheduler started...')
+
+async def run_nats():
+    """Running nats listeners"""
+    print('Connecting to nats...')
+    nc = NATS()
+    server = environ.get('NATS_URL', 'nats://localhost:4222')
+    user = environ.get('NATS_USER', None)
+    password = environ.get('NATS_PASS', None)
+
+    await nc.connect(server, user=user, password=password)
+    await nc.subscribe('domains.parse', cb=process_domain_event)
+    await nc.subscribe('domains.remove', cb=remove_domain_event)
+    print("Listening for messages through nats...")
+
+async def main():
+    """Main function to start all tasks."""
+    await asyncio.gather(
+        run_nats(),
+        run_scheduler()
+    )
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+
+    try:
+        loop.run_until_complete(main())
+        loop.run_forever()
+    except (KeyboardInterrupt, SystemExit):
+        print("Received exit signal, shutting down...")
+        tasks = asyncio.all_tasks(loop=loop)
+        for task in tasks:
+            task.cancel()
+            try:
+                loop.run_until_complete(task)  # Wait for task to be cancelled.
+            except asyncio.CancelledError:
+                pass
+    finally:
+        print("Shutting down...")
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        print("Shutdown complete.")

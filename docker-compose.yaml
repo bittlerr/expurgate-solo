@@ -1,0 +1,94 @@
+version: "3.7"
+
+services:
+  # pdns-dnsdist:
+  #   image: powerdns/dnsdist-19
+  #   container_name: pdns-dnsdist
+  #   volumes:
+  #     - ./dnsdist.conf:/etc/dnsdist/dnsdist.conf
+  #   networks:
+  #     - expurgate-network
+  #   ports:
+  #     - 5357:53/udp
+  #     - 5357:53/tcp
+  #     - 8089:8083
+
+  # pdns-recursor:
+  #   image: powerdns/pdns-recursor-50
+  #   container_name: pdns-recursor
+  #   volumes:
+  #     - ./recursor.conf:/etc/powerdns/recursor.conf
+  #   networks:
+  #     - expurgate-network
+  #   ports:
+  #     - 5356:53/udp
+
+  expurgate-rep-1:
+    image: expurgate-rep
+    container_name: expurgate-rep-1
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - 5354:53/udp
+      - 9002:9001
+    # dns:
+    # - pdns-recursor
+    # - 192.168.48.2
+    environment:
+      AUTOSPF_TOKEN: null
+      AUTOSPF_URL: null
+      ROLLBAR_TOKEN: null
+      ROLLBAR_ENV: null
+      NATS_URL: null
+      NATS_USER: null
+      NATS_PASS: null
+      SOURCE_PREFIX: null
+      ZONE: null
+    # depends_on:
+    #   - pdns-recursor
+    networks:
+      - expurgate-network
+
+  # expurgate-rep-2:
+  #   image: expurgate-rep
+  #   container_name: expurgate-rep-2
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - 5355:53/udp
+  #     - 9001:9001
+  #   #   dns:
+  #   #     - 192.168.48.2
+  #   #     # - pdns-recursor
+  #   environment:
+  #     AUTOSPF_TOKEN: null
+  #     AUTOSPF_URL: null
+  #     ROLLBAR_TOKEN: null
+  #     ROLLBAR_ENV: null
+  #     NATS_URL: null
+  #     NATS_USER: null
+  #     NATS_PASS: null
+  #     SOURCE_PREFIX: null
+  #     ZONE: null
+  #     #   depends_on:
+  #     #     - pdns-recursor
+  #   networks:
+  #     - expurgate-network
+
+  expurgate-nats:
+    image: nats
+    container_name: expurgate-nats
+    command: "-DV -c /etc/nats/nats-server.conf"
+    restart: always
+    volumes:
+      - ./nats.conf:/etc/nats/nats-server.conf
+    ports:
+      - 4226:4222
+    networks:
+      - expurgate-network
+
+networks:
+  expurgate-network:
+    driver: bridge
