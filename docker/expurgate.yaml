@@ -15,6 +15,7 @@ services:
       NATS_PASS: null
       SOURCE_PREFIX: null
       ZONE: null
+      RECURSOR_IP: null
     networks:
       - expurgate-network
     volumes:

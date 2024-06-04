@@ -35,11 +35,15 @@ class SPFProcessor:
     ip4_subnet_gen_reg = r'^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/([1-2][0-9]|[3][0-1])$'
     ip4_subnet_32_reg = r'^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(/32)?$'
 
-    def __init__(self, source_prefix = '_wqjnwiwc'):
+    def __init__(self, source_prefix = '_wqjnwiwc', nameserver = None):
         self.source_prefix = source_prefix
         self.dns_cache = {}
         self.includes = []
         self.ipmonitor = []
+        self.resolver = dns.resolver.Resolver()
+
+        if nameserver:
+            self.resolver.nameservers = [nameserver]
 
     def handle_error(self, error):
         """Handling errors."""
@@ -53,7 +57,7 @@ class SPFProcessor:
 
         if lookup_key not in self.dns_cache:
             try:
-                rrset = dns.resolver.resolve(domain, record_type).rrset
+                rrset = self.resolver.resolve(domain, record_type).rrset
                 lookup = [dns_record.to_text() for dns_record in rrset]
             except Exception as e:
                 error = "DNS Resolution Error - " + record_type + ":" + domain + ' err: ' + str(e)
@@ -338,7 +342,7 @@ class RBLDNSDProcessor:
 
     def process_rbldnsd(self, domain):
         """Process rbldnsd config file for specific domain."""
-        spf_processor = SPFProcessor(environ.get('SOURCE_PREFIX', None))
+        spf_processor = SPFProcessor(environ.get('SOURCE_PREFIX', None), environ.get('RECURSOR_IP', None))
         print('started new processing for domain: ' + domain)
         config_parts, gen_errors = spf_processor.get_rbldnsd_part(domain)
         spf_processor.ipmonitor.sort()

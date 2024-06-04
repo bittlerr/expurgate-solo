@@ -1,5 +1,7 @@
-addAction(AllRule(), LogAction("/dev/stdout"))
-addResponseAction(AllRule(), LogResponseAction("/dev/stdout"))
+if os.getenv("DEBUG") == 'true' then
+    addAction(AllRule(), LogAction("/dev/stdout"))
+    addResponseAction(AllRule(), LogResponseAction("/dev/stdout"))
+end
 
 function split(inputstr, sep)
     if sep == nil then
@@ -18,18 +20,6 @@ end
 local recursor_dns_servers = os.getenv("RECURSOR_DNS_SERVERS")
 local expurgate_dns_servers = os.getenv("EXPURGATE_DNS_SERVERS")
 
-if recursor_dns_servers then
-    local servers = split(recursor_dns_servers, ",")
-    
-    for _, server in ipairs(servers) do
-        newServer({address=server, pool="recursor"})
-    end
-
-    addAction(AllRule(), PoolAction("recursor"))
-else
-    print("Environment variable RECURSOR_DNS_SERVERS not set")
-end
-
 if expurgate_dns_servers then
     local servers = split(expurgate_dns_servers, ",")
     
@@ -46,6 +36,18 @@ if expurgate_dns_servers then
     end
 else
     print("Environment variable EXPURGATE_DNS_SERVERS not set")
+end
+
+if recursor_dns_servers then
+    local servers = split(recursor_dns_servers, ",")
+    
+    for _, server in ipairs(servers) do
+        newServer({address=server, pool="recursor"})
+    end
+
+    addAction(AllRule(), PoolAction("recursor"))
+else
+    print("Environment variable RECURSOR_DNS_SERVERS not set")
 end
 
 -- Allow queries from any source
