@@ -1,0 +1,6 @@
+/config/output
+/docker
+/configs
+.env
+*.pyc
+tmp

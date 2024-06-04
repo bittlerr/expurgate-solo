@@ -1,0 +1,25 @@
+name: "powerdns-dnsdist"
+
+services:
+  powerdns-dnsdist:
+    image: powerdns/dnsdist-19
+    container_name: powerdns-dnsdist
+    restart: always
+    environment:
+      RECURSOR_DNS_SERVERS: null
+      EXPURGATE_DNS_SERVERS: null
+      EXPURGATE_ZONE: null
+      WEB_PASSWORD: null
+    volumes:
+      - ./dnsdist.conf:/etc/dnsdist/dnsdist.conf
+    networks:
+      - expurgate-network
+    ports:
+      - 53:53/udp
+      - 53:53/tcp
+      # optional web interface
+      - 8089:8083
+
+networks:
+  expurgate-network:
+    driver: bridge

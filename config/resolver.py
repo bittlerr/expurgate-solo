@@ -296,7 +296,6 @@ class SPFProcessor:
 class RBLDNSDProcessor:
     """Processing rbldnsd config files."""
     ipmonitor_compare = {}
-    # def __init__(self):
 
     def rbldns_refresh(self):
         """Notify rbldnsd to refresh the config file."""
@@ -306,6 +305,7 @@ class RBLDNSDProcessor:
             os.kill(int(rbldnsdpid), signal.SIGHUP)
         except Exception as e:
             print("Uh-oh! Something went wrong, check 'rbldnsd' is running :", e)
+            rollbar.report_exc_info()
         else:
             print(f"Success notifying pid: {rbldnsdpid}")
 
@@ -326,6 +326,13 @@ class RBLDNSDProcessor:
         """Write config to a file."""
         with open(src_path, 'w', encoding='utf-8') as fp:
             fp.write('\n'.join(rbldnsd_config))
+            
+        if os.path.exists(dst_path) and os.path.exists('backups'):
+            current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            backup_path = f"backups/{current_time}_{dst_path.split('/')[-1]}"
+
+            shutil.copy(dst_path, backup_path)
+            print('Backup created: ' + backup_path)
 
         shutil.move(src_path, dst_path)
         print('Writing config file:' + dst_path)
@@ -341,8 +348,9 @@ class RBLDNSDProcessor:
         ipmonitor_compare = self.ipmonitor_compare
 
         if len(gen_errors) > 0:
-            print('Error(s) detected while processing SPF records for domain: ' + domain)
-            print('\n'.join(gen_errors))
+            err_msg = f"Error(s) occurred during processing domain: {domain}\n{'\n'.join(gen_errors)}"
+            print(err_msg)
+            rollbar.report_message(err_msg, level="error")
             print('Aborting further processing for domain.')
             return False
 
@@ -351,15 +359,16 @@ class RBLDNSDProcessor:
         if (domain in ipmonitor_compare) and (ipmonitor_compare[domain] != ipmonitor):
             changes_detected += 1
             print('Change detected! domain:' + domain)
-            print('Previous Record: ' + str(ipmonitor_compare[domain]))
-            print('New Record: ' + str(ipmonitor))
+            # print('Previous Record: ' + str(ipmonitor_compare[domain]))
+            # print('New Record: ' + str(ipmonitor))
 
             ips_added = [d for d in ipmonitor if d not in ipmonitor_compare[domain]]
             ips_removed = [d for d in ipmonitor_compare[domain] if d not in ipmonitor]
 
-            print('Change Summary: +' + str(ips_added) + ' -' + str(ips_removed) )
+            # logs for changes
+            # print('Change Summary: +' + str(ips_added) + ' -' + str(ips_removed) )
 
-            change_result = (strftime("%Y-%m-%dT%H:%M:%S", localtime()) + ' | CHANGE:' + domain + " | " + "+" + str(ips_added) + " -" + str(ips_removed) + '\n')
+            change_result = (strftime("%Y-%m-%dT%H:%M:%S", localtime()) + ' | CHANGE:' + domain + " | " + "+" + str(ips_added) + " -" + str(ips_removed))
 
             print('Changes: ' + change_result)
 
@@ -386,17 +395,13 @@ class RBLDNSDProcessor:
         """Reset state."""
         self.ipmonitor_compare = {}
 
-def get_domains():
-    """Get list of domains from AutoSPF api"""
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + environ.get('AUTOSPF_TOKEN')
-    }
+async def get_domains():
+    """Get list of domains from AutoSPF"""
     domains = []
     try:
-        response = requests.request("GET", environ.get('AUTOSPF_URL'), headers=headers, timeout=15)
-        out = response.text
-        domain_list = json.loads(out)
+        nc = await get_nats_client()
+        response = await nc.request('domains.list', b'list', timeout=15)
+        domain_list = json.loads(response.data.decode())
         jsonpath_expression = parse("$..name")
 
         for match in jsonpath_expression.find(domain_list):
@@ -421,7 +426,7 @@ def rollbar_exception_catcher(func):
 async def process_domains():
     """Processing domains"""
     processor = RBLDNSDProcessor()
-    domains = get_domains()
+    domains = await get_domains()
     should_refresh = False
     
     for domain in domains:
@@ -440,8 +445,8 @@ async def process_domains():
         print('No changes detected, skipping refresh')
 
 @rollbar_exception_catcher
-async def process_domain_event(msg):
-    """Processing domain event from nats"""
+async def domain_process_event(msg):
+    """Domain processing event from nats"""
     data = json.loads(msg.data.decode())
     domain = data['domain']
     print('Asked to process domain through nats: ' + domain)
@@ -455,8 +460,8 @@ async def process_domain_event(msg):
         processor.rbldns_refresh()
 
 @rollbar_exception_catcher
-async def remove_domain_event(msg):
-    """Remove domain event from nats"""
+async def domain_remove_event(msg):
+    """Domain remove event from nats"""
     data = json.loads(msg.data.decode())
     domain = data['domain']
     print('Asked to remove domain through nats: ' + domain)
@@ -487,8 +492,8 @@ async def run_scheduler():
     scheduler.start()
     print('Scheduler started...')
 
-async def run_nats():
-    """Running nats listeners"""
+async def get_nats_client():
+    """Build nats client."""
     print('Connecting to nats...')
     nc = NATS()
     server = environ.get('NATS_URL', 'nats://localhost:4222')
@@ -496,8 +501,16 @@ async def run_nats():
     password = environ.get('NATS_PASS', None)
 
     await nc.connect(server, user=user, password=password)
-    await nc.subscribe('domains.parse', cb=process_domain_event)
-    await nc.subscribe('domains.remove', cb=remove_domain_event)
+
+    return nc
+
+async def run_nats():
+    """Running nats listeners"""
+    print('Running nats listeners...')
+    nc = await get_nats_client()
+
+    await nc.subscribe('domains.parse', cb=domain_process_event)
+    await nc.subscribe('domains.remove', cb=domain_remove_event)
     print("Listening for messages through nats...")
 
 async def main():
@@ -508,7 +521,7 @@ async def main():
     )
 
 if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
 
     try:
         loop.run_until_complete(main())

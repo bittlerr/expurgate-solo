@@ -1,0 +1,21 @@
+name: "expurgate-nats"
+
+services:
+  expurgate-nats:
+    image: nats:2-alpine
+    container_name: expurgate-nats
+    command: "-c /etc/nats/nats-server.conf"
+    # debug run
+    # command: "-DV -c /etc/nats/nats-server.conf"
+    restart: always
+    volumes:
+      - ./nats.conf:/etc/nats/nats-server.conf
+    ports:
+      - 4002:4002
+      - 4222:4222
+    networks:
+      - expurgate-network
+
+networks:
+  expurgate-network:
+    driver: bridge

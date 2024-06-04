@@ -1,0 +1,18 @@
+name: "powerdns-recursor"
+
+services:
+  powerdns-recursor:
+    image: powerdns/pdns-recursor-50
+    container_name: powerdns-recursor
+    restart: always
+    volumes:
+      - ./recursor.conf:/etc/powerdns/recursor.conf
+    networks:
+      - expurgate-network
+    ports:
+      - 53:53/udp
+      - 53:53/tcp
+
+networks:
+  expurgate-network:
+    driver: bridge

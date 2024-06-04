@@ -1,0 +1,33 @@
+name: "expurgate"
+
+services:
+  expurgate:
+    image: registry.gitlab.com/bslavin/autospf/expurgate:${TAG-latest}
+    container_name: expurgate
+    build:
+      context: ../
+      dockerfile: Dockerfile
+    environment:
+      ROLLBAR_TOKEN: null
+      ROLLBAR_ENV: null
+      NATS_URL: null
+      NATS_USER: null
+      NATS_PASS: null
+      SOURCE_PREFIX: null
+      ZONE: null
+    networks:
+      - expurgate-network
+    volumes:
+      - expurgate-backups:/opt/expurgate/backups
+    ports:
+      # - 53:53/udp
+      # - 53:53/tcp
+      # optional web interface
+      - 9002:9001
+
+volumes:
+  expurgate-backups:
+
+networks:
+  expurgate-network:
+    driver: bridge
