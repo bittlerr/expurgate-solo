@@ -18,7 +18,6 @@ import json
 import rollbar
 from dotenv import load_dotenv
 import dns.resolver
-import requests
 from jsonpath_ng.ext import parse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from nats.aio.client import Client as NATS
