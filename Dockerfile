@@ -13,10 +13,10 @@ RUN pip3 install dnspython requests jsonpath-ng rollbar python-dotenv apschedule
     && mv /opt/expurgate/config/resolver.py /opt/expurgate/ \
     && mkdir -p /opt/expurgate/output/ \
     && mv /opt/expurgate/config/running-config /var/lib/rbldnsd/ \
+    && chmod 644 /var/lib/rbldnsd/running-config \
     && chmod 755 /opt/expurgate/config/run.sh \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/
 WORKDIR /opt/expurgate/
-
 
 #VOLUME ["/var/lib/rbldnsd"]
 
